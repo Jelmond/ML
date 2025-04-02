@@ -4,6 +4,39 @@ import time
 import random
 from PIL import Image
 
+def get_next_number(directory, prefix=""):
+    """
+    Определяет следующий доступный номер для именования файлов или папок в директории.
+    
+    Args:
+        directory: Директория для проверки
+        prefix: Префикс имени файла или папки
+        
+    Returns:
+        Следующий доступный номер
+    """
+    if not os.path.exists(directory):
+        return 1
+        
+    # Ищем все папки с числовыми именами
+    items = [item for item in os.listdir(directory) 
+             if os.path.isdir(os.path.join(directory, item)) and item.startswith(prefix)]
+    
+    if not items:
+        return 1
+        
+    # Извлекаем числа из имен папок
+    numbers = []
+    for item in items:
+        name = item.replace(prefix, "")
+        try:
+            numbers.append(int(name))
+        except ValueError:
+            continue
+    
+    # Возвращаем следующий номер
+    return max(numbers) + 1 if numbers else 1
+
 def crop_overlapping_images(image_path, output_dir="results", 
                            min_crop_percentage=0.5,
                            max_crop_percentage=0.8,
@@ -40,6 +73,13 @@ def crop_overlapping_images(image_path, output_dir="results",
         os.makedirs(output_dir)
     
     try:
+        # Получаем следующий доступный номер для именования папки
+        next_number = get_next_number(output_dir)
+        
+        # Создаем папку с номером для текущего результата
+        result_dir = os.path.join(output_dir, str(next_number))
+        os.makedirs(result_dir)
+        
         # Открываем изображение
         img = Image.open(image_path)
         width, height = img.size
@@ -113,10 +153,9 @@ def crop_overlapping_images(image_path, output_dir="results",
         second_cropped_img = second_cropped_img.rotate(second_rotation, expand=True)
         
         # Формируем имена выходных файлов
-        filename = os.path.basename(image_path)
-        name, ext = os.path.splitext(filename)
-        first_output_path = os.path.join(output_dir, f"{name}_crop1{ext}")
-        second_output_path = os.path.join(output_dir, f"{name}_crop2{ext}")
+        _, ext = os.path.splitext(image_path)
+        first_output_path = os.path.join(result_dir, f"1{ext}")
+        second_output_path = os.path.join(result_dir, f"2{ext}")
         
         # Сохраняем результаты
         first_cropped_img.save(first_output_path)
