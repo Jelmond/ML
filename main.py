@@ -3,6 +3,8 @@ import sys
 import time
 import random
 from PIL import Image
+import numpy as np
+import cv2
 
 def get_next_number(directory, prefix=""):
     """
@@ -38,9 +40,9 @@ def get_next_number(directory, prefix=""):
     return max(numbers) + 1 if numbers else 1
 
 def crop_overlapping_images(image_path, output_dir="results", 
-                           min_crop_percentage=0.5,
-                           max_crop_percentage=0.8,
-                           overlap_percentage=0.5,
+                           min_crop_percentage=0.2,
+                           max_crop_percentage=0.4,
+                           overlap_percentage=0.05,
                            max_rotation_angle=15):
     """
     Вырезает два фрагмента изображения с пересекающейся областью, 
@@ -58,15 +60,7 @@ def crop_overlapping_images(image_path, output_dir="results",
         Кортеж из:
         - путь к первому фрагменту
         - путь ко второму фрагменту
-        - словарь с информацией для склеивания:
-          {
-            'first_image': (x1, y1),  # Координаты начала пересечения в первом изображении
-            'second_image': (x2, y2),  # Координаты начала пересечения во втором изображении
-            'width': w,               # Ширина области пересечения
-            'height': h,              # Высота области пересечения
-            'first_rotation': angle1, # Угол поворота первого изображения
-            'second_rotation': angle2 # Угол поворота второго изображения
-          }
+        - словарь с информацией для склеивания
     """
     # Создаем директорию для результатов, если она не существует
     if not os.path.exists(output_dir):
@@ -148,9 +142,58 @@ def crop_overlapping_images(image_path, output_dir="results",
         first_rotation = random.uniform(-max_rotation_angle, max_rotation_angle)
         second_rotation = random.uniform(-max_rotation_angle, max_rotation_angle)
         
-        # Поворачиваем изображения
-        first_cropped_img = first_cropped_img.rotate(first_rotation, expand=True)
-        second_cropped_img = second_cropped_img.rotate(second_rotation, expand=True)
+        # Вместо простого поворота с расширением, используем аффинную трансформацию
+        # Преобразуем PIL изображения в массивы numpy для работы с OpenCV
+        first_cv = np.array(first_cropped_img)
+        second_cv = np.array(second_cropped_img)
+        
+        # Конвертируем в BGR для OpenCV, если изображения RGB
+        if len(first_cv.shape) == 3 and first_cv.shape[2] == 3:
+            first_cv = cv2.cvtColor(first_cv, cv2.COLOR_RGB2BGR)
+            second_cv = cv2.cvtColor(second_cv, cv2.COLOR_RGB2BGR)
+        
+        # Получаем размеры изображений
+        h1, w1 = first_cv.shape[:2]
+        h2, w2 = second_cv.shape[:2]
+        
+        # Создаем матрицы поворота
+        center1 = (w1 // 2, h1 // 2)
+        center2 = (w2 // 2, h2 // 2)
+        
+        # Создаем матрицы поворота
+        M1 = cv2.getRotationMatrix2D(center1, first_rotation, 1.0)
+        M2 = cv2.getRotationMatrix2D(center2, second_rotation, 1.0)
+        
+        # Вычисляем новые размеры после поворота
+        cos1 = abs(M1[0, 0])
+        sin1 = abs(M1[0, 1])
+        new_w1 = int((h1 * sin1) + (w1 * cos1))
+        new_h1 = int((h1 * cos1) + (w1 * sin1))
+        
+        cos2 = abs(M2[0, 0])
+        sin2 = abs(M2[0, 1])
+        new_w2 = int((h2 * sin2) + (w2 * cos2))
+        new_h2 = int((h2 * cos2) + (w2 * sin2))
+        
+        # Корректируем матрицы поворота
+        M1[0, 2] += (new_w1 / 2) - center1[0]
+        M1[1, 2] += (new_h1 / 2) - center1[1]
+        
+        M2[0, 2] += (new_w2 / 2) - center2[0]
+        M2[1, 2] += (new_h2 / 2) - center2[1]
+        
+        # Применяем поворот
+        first_rotated = cv2.warpAffine(first_cv, M1, (new_w1, new_h1), flags=cv2.INTER_LINEAR)
+        second_rotated = cv2.warpAffine(second_cv, M2, (new_w2, new_h2), flags=cv2.INTER_LINEAR)
+        
+        # Конвертируем обратно в RGB для PIL
+        if len(first_rotated.shape) == 3 and first_rotated.shape[2] == 3:
+            first_rotated = cv2.cvtColor(first_rotated, cv2.COLOR_BGR2RGB)
+            second_rotated = cv2.cvtColor(second_rotated, cv2.COLOR_BGR2RGB)
+        
+        # Преобразуем обратно в PIL изображения
+        first_rotated_pil = Image.fromarray(first_rotated)
+        second_rotated_pil = Image.fromarray(second_rotated)
         
         # Формируем имена выходных файлов
         _, ext = os.path.splitext(image_path)
@@ -158,17 +201,23 @@ def crop_overlapping_images(image_path, output_dir="results",
         second_output_path = os.path.join(result_dir, f"2{ext}")
         
         # Сохраняем результаты
-        first_cropped_img.save(first_output_path)
-        second_cropped_img.save(second_output_path)
+        first_rotated_pil.save(first_output_path)
+        second_rotated_pil.save(second_output_path)
         
-        # Создаем словарь с информацией о пересечении и поворотах
+        # Обновляем информацию о пересечении с учетом поворота
+        # Для простоты мы сохраняем исходные координаты пересечения и углы поворота,
+        # а в функции склейки будем учитывать эти углы
         overlap_info = {
             'first_image': (first_overlap_x, first_overlap_y),
             'second_image': (second_overlap_x, second_overlap_y),
             'width': overlap_width,
             'height': overlap_height,
             'first_rotation': first_rotation,
-            'second_rotation': second_rotation
+            'second_rotation': second_rotation,
+            'first_original_size': (w1, h1),
+            'second_original_size': (w2, h2),
+            'first_rotated_size': (new_w1, new_h1),
+            'second_rotated_size': (new_w2, new_h2)
         }
         
         print(f"Первый фрагмент сохранен в {first_output_path}")
@@ -186,6 +235,8 @@ def crop_overlapping_images(image_path, output_dir="results",
     
     except Exception as e:
         print(f"Ошибка при обработке изображения: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None, None
 
 def crop_image(image_path, output_dir="results", crop_percentage=0.1):
