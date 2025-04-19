@@ -33,8 +33,11 @@ stitched/
 *.png
 *.gif
 *.bmp
+*.tiff
+*.tif
 !example_images/*.jpg
 !example_images/*.png
+!example_images/*.tiff
 
 # IDE
 .idea/
