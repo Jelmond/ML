@@ -27,7 +27,7 @@ class XRayStitcher:
         #     raise ValueError(f"Unsupported feature method: {feature_method}")
             
         # Initialize feature matcher
-        self.matcher = cv2.BFMatcher()
+        self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
     
     def load_images(self, img1_path, img2_path):
         """Load and preprocess X-ray images."""
@@ -103,80 +103,66 @@ class XRayStitcher:
     
     def detect_and_match_features(self):
         """Enhanced feature detection with multi-scale approach for anatomical structures."""
-        # Create multiple scaled versions of the images
-        scales = [0.5, 0.75, 1.0, 1.5, 2.0]
-        all_kp1, all_des1 = [], []
-        all_kp2, all_des2 = [], []
-        
-        for scale in scales:
-            # Resize images for multi-scale detection
-            if scale != 1.0:
-                h1, w1 = self.img1.shape
-                h2, w2 = self.img2.shape
-                resized1 = cv2.resize(self.img1, (int(w1 * scale), int(h1 * scale)))
-                resized2 = cv2.resize(self.img2, (int(w2 * scale), int(h2 * scale)))
-            else:
-                resized1, resized2 = self.img1, self.img2
-            
-            # Detect keypoints at this scale
-            kp1 = self.detector.detect(resized1, None)
-            kp2 = self.detector.detect(resized2, None)
-            
-            # Compute descriptors
-            kp1, des1 = self.detector.compute(resized1, kp1)
-            kp2, des2 = self.detector.compute(resized2, kp2)
-            
-            # Adjust keypoint coordinates back to original scale
-            if scale != 1.0:
-                for kp in kp1:
-                    kp.pt = (kp.pt[0] / scale, kp.pt[1] / scale)
-                for kp in kp2:
-                    kp.pt = (kp.pt[0] / scale, kp.pt[1] / scale)
-            
-            # Add to collection
-            if des1 is not None and des2 is not None:
-                all_kp1.extend(kp1)
-                all_des1.append(des1)
-                all_kp2.extend(kp2)
-                all_des2.append(des2)
-        
-        # Combine descriptors
-        if all_des1 and all_des2:
-            des1 = np.vstack(all_des1)
-            des2 = np.vstack(all_des2)
-            
-            print(f"Detected {len(all_kp1)} keypoints in first image across scales")
-            print(f"Detected {len(all_kp2)} keypoints in second image across scales")
-            
-            self.kp1, self.kp2 = all_kp1, all_kp2
-            
-            # Match with more relaxed parameters
-            matches = self.matcher.knnMatch(des1, des2, k=2)
-            
-            # Apply relaxed ratio test
-            good_matches = []
-            for m, n in matches:
-                if m.distance < 0.95 * n.distance:  # Very relaxed ratio
-                    good_matches.append(m)
-            
-            print(f"Found {len(good_matches)} good matches")
-            self.matches = good_matches
-            
-            # Extract matched keypoints
-            if len(good_matches) >= 4:
-                src_pts = np.array([[all_kp1[m.queryIdx].pt[0], all_kp1[m.queryIdx].pt[1]] 
-                                   for m in good_matches], dtype=np.float32).reshape(-1, 1, 2)
-                dst_pts = np.array([[all_kp2[m.trainIdx].pt[0], all_kp2[m.trainIdx].pt[1]] 
-                                   for m in good_matches], dtype=np.float32).reshape(-1, 1, 2)
-            else:
-                print("Warning: Very few matches found.")
-                src_pts = np.zeros((0, 1, 2), dtype=np.float32)
-                dst_pts = np.zeros((0, 1, 2), dtype=np.float32)
-            
-            return src_pts, dst_pts, good_matches
-        else:
-            print("No features detected across scales")
-            return np.zeros((0, 1, 2), dtype=np.float32), np.zeros((0, 1, 2), dtype=np.float32), []
+        # 1) detect & describe
+        kp1, des1 = self.detector.detectAndCompute(self.img1, None)
+        kp2, des2 = self.detector.detectAndCompute(self.img2, None)
+
+        if des1 is None or des2 is None:
+            return np.zeros((0,1,2),np.float32), np.zeros((0,1,2),np.float32), []
+
+        # 2) KNN + ratio + orientation
+        knn = self.matcher.knnMatch(des1, des2, k=2)
+        ratio_thresh = 0.8
+        angle_thresh = 30.0
+        good = []
+        for m,n in knn:
+            if m.distance < ratio_thresh * n.distance:
+                a1 = kp1[m.queryIdx].angle
+                a2 = kp2[m.trainIdx].angle
+                diff = abs((a1 - a2 + 180) % 360 - 180)
+                if diff < angle_thresh:
+                    good.append(m)
+
+        # 3) Mutual‑NN: match des2→des1 and intersect
+        back = {m.trainIdx:m for m in self.matcher.knnMatch(des2, des1, k=1)}
+        mutual = [m for m in good
+                  if back.get(m.queryIdx) is not None
+                  and back[m.queryIdx].trainIdx == m.queryIdx]
+
+        print(f"After ratio+angle: {len(good)}, after mutual‑NN: {len(mutual)}")
+
+        # 4) rebuild src_pts/dst_pts from mutual list
+        if len(mutual) < 4:
+            return np.zeros((0,1,2),np.float32), np.zeros((0,1,2),np.float32), mutual
+
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in mutual]).reshape(-1,1,2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in mutual]).reshape(-1,1,2)
+
+        # 5) optional: fundamental RANSAC
+        F, mask = cv2.findFundamentalMat(src_pts, dst_pts,
+                                         cv2.FM_RANSAC, 
+                                         ransacReprojThreshold=1.0,
+                                         confidence=0.99)
+        if mask is not None:
+            mask = mask.ravel().astype(bool)
+            src_pts = src_pts[mask]
+            dst_pts = dst_pts[mask]
+            mutual  = [m for m,keep in zip(mutual, mask) if keep]
+            print(f"After F‑RANSAC: {len(mutual)}")
+
+        # 6) spatial consistency
+        src_pts, dst_pts, mutual = self.check_spatial_consistency(src_pts, dst_pts, mutual)
+
+        return src_pts, dst_pts, mutual
+    
+    def mutual_filter(self, kp1, des1, kp2, des2, matches12):
+        # Build map trainIdx→best queryIdx
+        matches21 = self.matcher.knnMatch(des2, des1, k=1)
+        back_map = {m.trainIdx: m.queryIdx for m,n in matches21}
+
+        mutual = [m for m in matches12 
+                  if back_map.get(m.queryIdx, None) == m.trainIdx]
+        return mutual
     
     def compute_homography(self, src_pts, dst_pts):
         """Compute the homography matrix with more tolerant parameters."""
@@ -530,27 +516,30 @@ class XRayStitcher:
         else:
             return np.zeros((0, 1, 2), dtype=np.float32), np.zeros((0, 1, 2), dtype=np.float32), []
     
-    def check_spatial_consistency(self, src_pts, dst_pts, good_matches):
+    def check_spatial_consistency(self, src_pts, dst_pts, matches):
         """
         Check spatial consistency of matches by analyzing local neighborhoods.
         Discards matches that don't have consistent neighbors.
         """
-        if len(good_matches) < 10:
-            return src_pts, dst_pts, good_matches
+        if len(matches) < 10:
+            return src_pts, dst_pts, matches
         
         # Convert points to more manageable format
         src_points = src_pts.reshape(-1, 2)
         dst_points = dst_pts.reshape(-1, 2)
         
         # Parameters
-        neighborhood_radius = 50  # Pixels
-        min_consistent_neighbors = 3
+        neighborhood_radius = 30        # was 50
+        min_consistent_neighbors = 4   # was 3
+        vec_sim_thresh = 0.8           # was 0.7
+        mag_ratio_min, mag_ratio_max = 0.8, 1.2  # tighter
+
         consistent_matches = []
         consistent_src_pts = []
         consistent_dst_pts = []
         
         # For each match, check if it has consistent neighbors
-        for i, match in enumerate(good_matches):
+        for i, match in enumerate(matches):
             # Current match points
             src_pt = src_points[i]
             dst_pt = dst_points[i]
@@ -573,16 +562,17 @@ class XRayStitcher:
                 vector_similarity = np.dot(src_vector, dst_vector) / (np.linalg.norm(src_vector) * np.linalg.norm(dst_vector) + 1e-6)
                 ratio_of_magnitudes = np.linalg.norm(dst_vector) / (np.linalg.norm(src_vector) + 1e-6)
                 
-                if vector_similarity > 0.7 and 0.7 < ratio_of_magnitudes < 1.3:
+                if vector_similarity > vec_sim_thresh \
+                   and mag_ratio_min < ratio_of_magnitudes < mag_ratio_max:
                     consistent_neighbors += 1
             
             # Keep match if it has enough consistent neighbors
             if consistent_neighbors >= min_consistent_neighbors:
-                consistent_matches.append(good_matches[i])
+                consistent_matches.append(matches[i])
                 consistent_src_pts.append(src_pt)
                 consistent_dst_pts.append(dst_pt)
         
-        print(f"Spatial consistency check: {len(consistent_matches)}/{len(good_matches)} matches retained")
+        print(f"Spatial consistency check: {len(consistent_matches)}/{len(matches)} matches retained")
         
         # Convert back to original format
         if len(consistent_matches) >= 4:
@@ -591,7 +581,7 @@ class XRayStitcher:
             return consistent_src_pts, consistent_dst_pts, consistent_matches
         else:
             # Not enough consistent matches, return original
-            return src_pts, dst_pts, good_matches
+            return src_pts, dst_pts, matches
     
     def visualize_match_context(self, save_path=None, max_windows=5):
         """Visualize the context around matches to help understand spatial relationships."""
